@@ -142,50 +142,146 @@ test('a missing distribution fails the snapshot request, never the process', asy
 });
 
 test('shipped code never climbs out of the plugin directory for a module', () => {
-  // The regression guard for this whole refactor: a `../../lib` import or a
-  // parent `../bin/blackboard.js` target would break a standalone install. It
-  // has to catch the shapes a regression actually takes, not just the spelling
-  // that was removed, so it reads relative literals AND the
-  // path.resolve/join('..', ...) chains and fs/`require` calls.
+  // The regression guard for this whole refactor. The pre-refactor plugin
+  // escaped in several shapes -- an `../../lib/model.js` import, an
+  // `../../lib/store.js` import, `path.resolve(HERE, '..', '..', 'bin',
+  // 'blackboard.js')`, and a reach for the parent `skills/` and `public/`
+  // trees (directly, or through a local `const PLUGIN = path.resolve(HERE, '..')`
+  // alias) -- so this looks at the positions that can actually name a path:
+  // module specifiers, path.resolve/path.join arguments, and fs call paths.
+  //
+  // It resolves rather than spells: each reference is walked segment by segment
+  // from the base it really starts at, and reported only if that walk leaves the
+  // plugin directory. That is what catches a parent `skills/` or `public/` reach,
+  // a chain that dips out and comes back, and Windows-style separators, none of
+  // which a search for 'two levels of ..' would notice.
+  //
+  // Limits, deliberately: it is a static text check, so it stops at indirection
+  // it cannot evaluate -- `const UP = '..'` used as a segment, a base that is
+  // itself an unevaluated call, a computed/imported path. It also ignores
+  // path-looking text that is not in a path-consuming position, because a
+  // quoted path inside an error message is prose, not a reference.
   const offenders = [];
 
+  /** Drop comments, leaving string and template content untouched. */
+  const stripComments = (text) => {
+    let out = '';
+    let state = null;
+    for (let i = 0; i < text.length; i += 1) {
+      const ch = text[i];
+      if (state) {
+        out += ch;
+        if (ch === '\\') { out += text[i + 1] ?? ''; i += 1; continue; }
+        if (ch === state) state = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === '`') { state = ch; out += ch; continue; }
+      if (ch === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i += 1; out += '\n'; continue; }
+      if (ch === '/' && text[i + 1] === '*') { i += 2; while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i += 1; i += 1; continue; }
+      out += ch;
+    }
+    return out;
+  };
+
+  /** The balanced argument text of the call whose '(' sits at `open`. */
+  const argsAt = (code, open) => {
+    let level = 0;
+    for (let i = open; i < code.length; i += 1) {
+      if (code[i] === '(') level += 1;
+      else if (code[i] === ')') {
+        level -= 1;
+        if (level === 0) return code.slice(open + 1, i);
+      }
+    }
+    return code.slice(open + 1);
+  };
+
+  /** Path segments named by the literals in a fragment (`\\` and `${…}` aware). */
+  const segmentsIn = (fragment) => {
+    const segments = [];
+    for (const match of fragment.matchAll(/'([^']*)'|"([^"]*)"|`([^`]*)`/g)) {
+      const text = (match[1] ?? match[2] ?? match[3] ?? '').replace(/\$\{[^}]*\}/g, '');
+      for (const segment of text.split(/[\\/]+/)) {
+        if (segment && segment !== '.') segments.push(segment);
+      }
+    }
+    return segments;
+  };
+
   /**
-   * How far each reference in a file travels up from the base it starts at.
-   * `base` is the number of levels that base sits below the plugin root: 0 for
-   * PLUGIN_ROOT, otherwise the file's own directory.
+   * Walk `segments` from `base` (levels below the plugin root) and report how
+   * far it ends up, plus whether it ever left. The final segment names the file
+   * being reached unless the whole chain names a directory.
    */
-  const climbEvents = (text, depth) => {
-    // Whole-line comments only: an inline `//` can be part of a literal.
-    const code = text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
-    const events = [];
-    // Relative specifiers, wherever they appear as a literal: `from`, `import(`,
-    // `require(`, `import.meta.resolve(...)`, or an fs call taking a path.
-    for (const match of code.matchAll(/['"`]((?:\.\.\/)+)([^'"`]*)/g)) {
-      events.push({ climb: match[1].length / 3, base: depth, target: match[2] });
+  const walk = (base, segments, { directory = false } = {}) => {
+    let level = base;
+    let escaped = false;
+    for (const segment of (directory ? segments : segments.slice(0, -1))) {
+      level += segment === '..' ? -1 : 1;
+      if (level < 0) escaped = true;
     }
-    // path.resolve/path.join chains: every standalone '..' segment is one level.
-    for (const match of code.matchAll(/path\.(?:resolve|join)\(([^)]*)\)/g)) {
-      const args = match[1];
-      const dots = (args.match(/['"]\.\.['"]/g) || []).length;
-      if (!dots) continue;
-      const literals = (args.split(/['"]\.\.['"]/).pop() || '').match(/['"]([^'"]+)['"]/g) || [];
-      const base = /PLUGIN_ROOT/.test(args) ? 0 : depth;
-      events.push({ climb: dots, base, target: literals.map((part) => part.slice(1, -1)).join('/') });
+    return { level, escaped };
+  };
+
+  /**
+   * Local names bound to a path chain, so a chain rooted at such a name is not
+   * mistaken for one rooted at the file's own directory. The pre-refactor skill
+   * installer did exactly this: `const PLUGIN = path.resolve(HERE, '..')` then
+   * `path.resolve(PLUGIN, '..', 'skills', 'blackboard')`.
+   */
+  const aliasLevels = (code, depth) => {
+    const levels = new Map();
+    const aliases = [];
+    for (const match of code.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*path\.(?:resolve|join)\s*\(/g)) {
+      const args = argsAt(code, match.index + match[0].length - 1);
+      const segments = segmentsIn(args);
+      const { level, escaped } = walk(baseOf(args, depth, levels), segments, { directory: true });
+      levels.set(match[1], level);
+      if (escaped || level < 0) aliases.push(match[1]);
     }
-    return events;
+    return { levels, aliases };
+  };
+
+  /** A chain rooted at PLUGIN_ROOT starts at the plugin root, a known alias at
+   *  wherever that alias resolved, anything else at this file's directory. */
+  const baseOf = (args, depth, aliases = new Map()) => {
+    const token = args.trim().split(/[\s,(]/)[0];
+    if (token === 'PLUGIN_ROOT') return 0;
+    if (aliases.has(token)) return aliases.get(token);
+    return depth;
   };
 
   const check = (full) => {
     if (!/\.(m?js)$/.test(path.basename(full))) return;
     const rel = path.relative(PLUGIN_ROOT, full);
     const dir = path.dirname(rel);
-    // A file may climb at most to the plugin root and still be reaching its own
-    // code; one level beyond that is the parent checkout.
     const depth = dir === '.' ? 0 : dir.split(path.sep).length;
-    const escapes = climbEvents(readFileSync(full, 'utf8'), depth)
-      .filter((event) => event.climb > event.base)
-      .filter((event) => event.target.startsWith('lib/') || event.target.startsWith('bin/'));
-    if (escapes.length) offenders.push(`${rel} -> ${escapes.map((event) => event.target).join(', ')}`);
+    const code = stripComments(readFileSync(full, 'utf8'));
+    const found = [];
+    const { levels: aliases, aliases: escaping } = aliasLevels(code, depth);
+    for (const name of escaping) found.push(`alias ${name}`);
+
+    for (const match of code.matchAll(/(?:from\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|import\.meta\.resolve\s*\(\s*|\bimport\s+)(['"])([^'"]+)\1/g)) {
+      const specifier = match[2];
+      if (!/^\.\.?[\\/]/.test(specifier)) continue;
+      if (walk(depth, segmentsIn(match[0])).escaped) found.push(`import ${specifier}`);
+    }
+
+    for (const match of code.matchAll(/path\.(?:resolve|join)\s*\(/g)) {
+      const args = argsAt(code, match.index + match[0].length - 1);
+      const segments = segmentsIn(args);
+      if (!segments.includes('..')) continue;
+      if (walk(baseOf(args, depth, aliases), segments).escaped) found.push(`path ${segments.join('/')}`);
+    }
+
+    for (const match of code.matchAll(/\b(?:readFileSync|writeFileSync|readdirSync|existsSync|statSync|mkdirSync|rmSync|cpSync|unlinkSync|accessSync|openSync)\s*\(/g)) {
+      const first = (argsAt(code, match.index + match[0].length - 1).split(',')[0] || '').trim();
+      if (!/^['"`]\.\.?[\\/]/.test(first)) continue;
+      const segments = segmentsIn(first);
+      if (walk(depth, segments).escaped) found.push(`fs ${segments.join('/')}`);
+    }
+
+    if (found.length) offenders.push(`${rel} -> ${found.join(' | ')}`);
   };
 
   const scan = (target) => {
