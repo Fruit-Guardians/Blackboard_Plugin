@@ -143,23 +143,51 @@ test('a missing distribution fails the snapshot request, never the process', asy
 
 test('shipped code never climbs out of the plugin directory for a module', () => {
   // The regression guard for this whole refactor: a `../../lib` import or a
-  // parent `../bin/blackboard.js` spawn target would break a standalone install.
+  // parent `../bin/blackboard.js` target would break a standalone install. It
+  // has to catch the shapes a regression actually takes, not just the spelling
+  // that was removed, so it reads relative literals AND the
+  // path.resolve/join('..', ...) chains and fs/`require` calls.
   const offenders = [];
+
+  /**
+   * How far each reference in a file travels up from the base it starts at.
+   * `base` is the number of levels that base sits below the plugin root: 0 for
+   * PLUGIN_ROOT, otherwise the file's own directory.
+   */
+  const climbEvents = (text, depth) => {
+    // Whole-line comments only: an inline `//` can be part of a literal.
+    const code = text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
+    const events = [];
+    // Relative specifiers, wherever they appear as a literal: `from`, `import(`,
+    // `require(`, `import.meta.resolve(...)`, or an fs call taking a path.
+    for (const match of code.matchAll(/['"`]((?:\.\.\/)+)([^'"`]*)/g)) {
+      events.push({ climb: match[1].length / 3, base: depth, target: match[2] });
+    }
+    // path.resolve/path.join chains: every standalone '..' segment is one level.
+    for (const match of code.matchAll(/path\.(?:resolve|join)\(([^)]*)\)/g)) {
+      const args = match[1];
+      const dots = (args.match(/['"]\.\.['"]/g) || []).length;
+      if (!dots) continue;
+      const literals = (args.split(/['"]\.\.['"]/).pop() || '').match(/['"]([^'"]+)['"]/g) || [];
+      const base = /PLUGIN_ROOT/.test(args) ? 0 : depth;
+      events.push({ climb: dots, base, target: literals.map((part) => part.slice(1, -1)).join('/') });
+    }
+    return events;
+  };
+
   const check = (full) => {
     if (!/\.(m?js)$/.test(path.basename(full))) return;
     const rel = path.relative(PLUGIN_ROOT, full);
     const dir = path.dirname(rel);
-    // A file may climb at most as many levels as it sits below the plugin root
-    // and still be importing our own code; one level more is the parent checkout.
+    // A file may climb at most to the plugin root and still be reaching its own
+    // code; one level beyond that is the parent checkout.
     const depth = dir === '.' ? 0 : dir.split(path.sep).length;
-    const text = readFileSync(full, 'utf8');
-    const escapes = [
-      new RegExp(`from\\s+['"](?:\\.\\.\\/){${depth + 1},}lib\\/`),
-      new RegExp(`import\\(\\s*['"](?:\\.\\.\\/){${depth + 1},}lib\\/`),
-      new RegExp(`['"](?:\\.\\.\\/){${depth + 1},}bin\\/blackboard\\.js['"]`),
-    ];
-    if (escapes.some((pattern) => pattern.test(text))) offenders.push(rel);
+    const escapes = climbEvents(readFileSync(full, 'utf8'), depth)
+      .filter((event) => event.climb > event.base)
+      .filter((event) => event.target.startsWith('lib/') || event.target.startsWith('bin/'));
+    if (escapes.length) offenders.push(`${rel} -> ${escapes.map((event) => event.target).join(', ')}`);
   };
+
   const scan = (target) => {
     if (statSync(target).isFile()) {
       check(target);
