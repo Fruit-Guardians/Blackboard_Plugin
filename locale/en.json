@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Blackboard",
+    "description": "Adds a Blackboard tab next to Trajectory in the conversation view ring, and exposes the eleven blackboard_* tools to the model."
+  }
+}
